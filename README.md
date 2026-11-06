@@ -2,8 +2,16 @@
 
 A native macOS app (Rust) that flashes Amlogic Android TV boxes over USB, with no Windows PC, no USB Burning Tool and no drivers.
 
+![Amlogic Flasher flashing a Tanix X4](docs/screenshot-flashing.png)
+
+*Flashing `super` on a real Tanix X4: 13.8 MiB/s over USB 2.0, checked on the Mac before writing and verified by the box after.*
+
+<details><summary>Idle screens: dark and light</summary>
+
 ![Amlogic Flasher — dark](docs/screenshot.png)
 ![Amlogic Flasher — light](docs/screenshot-light.png)
+
+</details>
 
 It speaks Amlogic's **ADNL** burning protocol to the box's own U-Boot, the same protocol as the vendor's USB Burning Tool. It writes **only the partitions you select** from a standard `aml_upgrade_package` `.img` file.
 
