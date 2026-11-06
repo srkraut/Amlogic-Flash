@@ -1,0 +1,12 @@
+[package]
+name = "amlogic-flash"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+crc32fast = "1"
+eframe = "0.29"
+rfd = "0.15"
+rusb = { version = "0.9", features = ["vendored"] }
+sha1 = "0.10"
