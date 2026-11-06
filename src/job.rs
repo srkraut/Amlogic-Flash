@@ -1,4 +1,4 @@
-//! The flashing workflow shared by the GUI and the CLI.
+//! Background jobs shared by the GUI and the CLI: image verification, probing and flashing.
 
 use crate::adnl::{self, Adnl};
 use crate::image::{AmlImage, SPARSE_MAGIC, human};
@@ -7,11 +7,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Ok,
+    Warn,
+    Error,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
-    Log(String),
-    /// label, fraction 0..=1 (None = indeterminate)
-    Progress(String, Option<f32>),
+    Log(Level, String),
+    /// `total == 0` means indeterminate. `bytes` tells the UI to show speed / ETA.
+    Progress { phase: String, done: u64, total: u64, bytes: bool },
+    /// Result of a SHA-1 check for one partition (name, ok).
+    PartCheck(String, bool),
+    CrcCheck(bool),
+    Identified(String),
     Done(Result<(), String>),
 }
 
@@ -26,8 +38,8 @@ pub struct FlashOptions {
 
 pub type Sink = dyn Fn(Event) + Send + Sync;
 
-fn log(s: &Sink, m: impl Into<String>) {
-    s(Event::Log(m.into()));
+fn log(s: &Sink, l: Level, m: impl Into<String>) {
+    s(Event::Log(l, m.into()));
 }
 
 /// Validate that a set of partitions can be flashed from this image.
@@ -41,7 +53,8 @@ pub fn plan(img: &AmlImage, parts: &[String]) -> Result<()> {
             bail!("refusing to write {p:?}: boot loader partitions need the full ROM-stage burn (use Amlogic USB Burning Tool)");
         }
         if item.is_sparse() {
-            let head = img.reader(item)?.read_all_prefix(4)?;
+            let mut head = [0u8; 4];
+            img.reader(item)?.read_at(0, &mut head)?;
             if head != SPARSE_MAGIC {
                 bail!("{p:?} is marked sparse but does not start with the Android sparse magic");
             }
@@ -53,53 +66,76 @@ pub fn plan(img: &AmlImage, parts: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Check header CRC and the SHA-1 of the given partitions on this Mac.
+pub fn verify_image(img: &AmlImage, parts: &[String], cancel: &AtomicBool, sink: &Sink) -> Result<()> {
+    let crc_ok = img.check_crc(|d, t| sink(Event::Progress { phase: "Checking image CRC".into(), done: d, total: t, bytes: true }))?;
+    sink(Event::CrcCheck(crc_ok));
+    if !crc_ok {
+        bail!("image header CRC/size mismatch: the file is corrupt or was modified without repacking");
+    }
+    log(sink, Level::Ok, "Image CRC OK");
+    let mut bad = vec![];
+    for p in parts {
+        if cancel.load(Ordering::SeqCst) {
+            bail!("cancelled");
+        }
+        let Some(item) = img.partition(p) else { continue };
+        let Some(want) = img.expected_sha1(p)? else {
+            log(sink, Level::Warn, format!("{p}: no checksum in image"));
+            continue;
+        };
+        let phase = format!("Checking {p} SHA-1");
+        let got = img.sha1_of(item, |d, t| sink(Event::Progress { phase: phase.clone(), done: d, total: t, bytes: true }))?;
+        let ok = got == want;
+        sink(Event::PartCheck(p.clone(), ok));
+        if ok {
+            log(sink, Level::Ok, format!("{p}: SHA-1 OK"));
+        } else {
+            log(sink, Level::Error, format!("{p}: SHA-1 MISMATCH (image says {want}, data is {got})"));
+            bad.push(p.clone());
+        }
+    }
+    if !bad.is_empty() {
+        bail!("checksum mismatch in: {}", bad.join(", "));
+    }
+    Ok(())
+}
+
 pub fn run(img: Arc<AmlImage>, opts: FlashOptions, cancel: Arc<AtomicBool>, sink: &Sink) -> Result<()> {
     if !opts.probe_only {
         plan(&img, &opts.partitions)?;
-        log(sink, format!("Image: {} (v{}, {} items, {})", img.path.display(), img.version, img.items.len(), human(img.file_size)));
-    }
-
-    if opts.precheck && !opts.probe_only {
-        sink(Event::Progress("Checking image CRC".into(), Some(0.0)));
-        let ok = img.check_crc(|d, t| sink(Event::Progress("Checking image CRC".into(), Some(d as f32 / t as f32))))?;
-        if !ok {
-            bail!("image header CRC/size mismatch: the file is corrupt or was modified without repacking");
-        }
-        log(sink, "Image CRC OK");
-        for p in &opts.partitions {
-            let item = img.partition(p).unwrap();
-            let want = img.expected_sha1(p)?.unwrap();
-            let label = format!("Checking {p} SHA-1");
-            let got = img.sha1_of(item, |d, t| sink(Event::Progress(label.clone(), Some(d as f32 / t as f32))))?;
-            if got != want {
-                bail!("{p}: SHA-1 in image ({want}) does not match data ({got})");
-            }
-            log(sink, format!("{p}: SHA-1 OK ({want})"));
+        log(sink, Level::Info, format!("Image: {} (v{}, {} items, {})", img.path.display(), img.version, img.items.len(), human(img.file_size)));
+        if opts.precheck {
+            verify_image(&img, &opts.partitions, &cancel, sink)?;
         }
     }
 
-    log(sink, "Waiting for the box in USB burning mode (1b8e:c004)…");
-    log(sink, "→ Connect the USB cable, then unplug and re-plug the box's POWER (no reset button).");
+    if !adnl::device_present() {
+        log(sink, Level::Info, "Waiting for the box in USB burning mode (1b8e:c004)…");
+        log(sink, Level::Info, "→ With the USB cable connected, unplug and re-plug the box's POWER (no reset button).");
+    }
     let start = Instant::now();
     while !adnl::device_present() {
         if cancel.load(Ordering::SeqCst) {
             bail!("cancelled before anything was written");
         }
         if start.elapsed() > opts.wait_for_device {
-            bail!("no device appeared within {}s", opts.wait_for_device.as_secs());
+            bail!("no box appeared within {} min", opts.wait_for_device.as_secs() / 60);
         }
-        sink(Event::Progress(format!("Waiting for device… {}s", start.elapsed().as_secs()), None));
-        std::thread::sleep(Duration::from_millis(50));
+        sink(Event::Progress { phase: format!("Waiting for box… {}s", start.elapsed().as_secs()), done: 0, total: 0, bytes: false });
+        std::thread::sleep(Duration::from_millis(30));
     }
 
     let dev = Adnl::open()?;
     let id = dev.identify()?;
-    log(sink, format!("Device: ADNL protocol {} (minor {}), stage {} [{:02x?}]", id.protocol, id.minor, id.stage_name(), &id.raw[..id.raw.len().min(12)]));
+    let desc = format!("ADNL protocol {}.{} · stage {}", id.protocol, id.minor, id.stage_name());
+    sink(Event::Identified(desc.clone()));
+    log(sink, Level::Info, format!("Device: {desc} [{:02x?}]", &id.raw[..id.raw.len().min(12)]));
     if !id.is_supported() {
         bail!("unsupported device state: need ADNL protocol 5/6 in U-Boot stage, got protocol {} stage {}. Nothing was written.", id.protocol, id.stage_name());
     }
     if opts.probe_only {
-        log(sink, "Probe only: no changes made.");
+        log(sink, Level::Ok, "Probe OK: box is ready. No changes were made.");
         return Ok(());
     }
     if cancel.load(Ordering::SeqCst) {
@@ -107,43 +143,27 @@ pub fn run(img: Arc<AmlImage>, opts: FlashOptions, cancel: Arc<AtomicBool>, sink
     }
 
     dev.prepare()?;
-    log(sink, "Burn session started (disk_initial 0: nothing erased)");
-    log(sink, "⚠ Do not unplug the box or the cable until it finishes.");
+    log(sink, Level::Info, "Burn session started (disk_initial 0 — nothing erased)");
+    log(sink, Level::Warn, "Do not unplug the box or the cable until it finishes.");
 
     for p in &opts.partitions {
         let item = img.partition(p).unwrap().clone();
         let want = img.expected_sha1(p)?.unwrap();
         let mut reader = img.reader(&item)?;
-        log(sink, format!("Writing {p}: {} as {}", human(item.size), item.format()));
+        log(sink, Level::Info, format!("Writing {p}: {} as {}", human(item.size), item.format()));
         let t0 = Instant::now();
-        let label = format!("Writing {p}");
-        dev.burn(&item, &mut reader, |d, t| {
-            let secs = t0.elapsed().as_secs_f32().max(0.001);
-            let rate = d as f32 / secs / (1024.0 * 1024.0);
-            sink(Event::Progress(format!("{label} — {} / {} ({rate:.1} MiB/s)", human(d), human(t)), Some(d as f32 / t as f32)));
-        })?;
-        log(sink, format!("{p}: transfer complete in {:.0}s", t0.elapsed().as_secs_f32()));
-        let vlabel = format!("Device verifying {p} SHA-1");
-        sink(Event::Progress(vlabel.clone(), None));
-        dev.verify_sha1(&want, |e| sink(Event::Progress(format!("{vlabel}… {}s", e.as_secs()), None)))?;
-        log(sink, format!("{p}: verified on device ✓"));
+        let phase = format!("Writing {p}");
+        dev.burn(&item, &mut reader, |d, t| sink(Event::Progress { phase: phase.clone(), done: d, total: t, bytes: true }))?;
+        log(sink, Level::Info, format!("{p}: transfer complete in {:.0}s", t0.elapsed().as_secs_f32()));
+        let vphase = format!("Box is verifying {p}");
+        dev.verify_sha1(&want, |e| sink(Event::Progress { phase: format!("{vphase}… {}s", e.as_secs()), done: 0, total: 0, bytes: false }))?;
+        log(sink, Level::Ok, format!("{p}: verified on the box"));
     }
 
     if opts.reboot {
-        log(sink, "Rebooting the box");
+        log(sink, Level::Info, "Rebooting the box");
         dev.reboot()?;
     }
-    log(sink, "Done. If Android shows \"Can't load Android system\", choose Factory data reset in recovery.");
+    log(sink, Level::Info, "If Android shows \"Can't load Android system\", choose Factory data reset in recovery.");
     Ok(())
-}
-
-trait PrefixRead {
-    fn read_all_prefix(&mut self, n: usize) -> Result<Vec<u8>>;
-}
-impl PrefixRead for crate::image::ItemReader {
-    fn read_all_prefix(&mut self, n: usize) -> Result<Vec<u8>> {
-        let mut v = vec![0u8; n];
-        self.read_at(0, &mut v)?;
-        Ok(v)
-    }
 }

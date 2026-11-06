@@ -109,6 +109,11 @@ impl AmlImage {
         Ok(Self { path: path.to_path_buf(), version, stored_crc, declared_size, file_size, items })
     }
 
+    /// Placeholder used for probe-only jobs.
+    pub fn empty() -> Self {
+        Self { path: PathBuf::new(), version: 0, stored_crc: 0, declared_size: 0, file_size: 0, items: vec![] }
+    }
+
     pub fn find(&self, main: &str, sub: &str) -> Option<&Item> {
         self.items.iter().find(|i| i.main_type == main && i.sub_type == sub)
     }
